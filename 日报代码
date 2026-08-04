@@ -1,4 +1,4 @@
-# excel_clean_split（功能重复没有删除，下面有优化后的功能）
+# excel_clean_split（该功能没有xls转xlsx的功能，xlsx文件可使用该代码）
 
 """独立的 Excel 数据清理分列功能；不依赖日报处理模块。"""
 from __future__ import annotations
@@ -966,7 +966,7 @@ def process_many(brand_files: Iterable[Path], import_path: Path, output_dir: Pat
         results.append(process_workbook(path, import_path, output_dir, processing_date, logger))
     return results
 
-# xls_clean_split
+# xls_clean_split（有xls转xlsx的功能）
 """独立的 XLS 转 XLSX 数据清理分列模块。
 
 本模块不导入 processor.py 或 excel_clean_split.py。旧版 XLS 的格式保真转换与
