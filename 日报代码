@@ -1,0 +1,1270 @@
+# excel_clean_split
+
+"""独立的 Excel 数据清理分列功能；不依赖日报处理模块。"""
+from __future__ import annotations
+
+from decimal import Decimal, InvalidOperation
+from copy import copy
+from pathlib import Path
+import os
+import queue
+import re
+import tempfile
+import threading
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+import winreg
+
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+
+REQUIRED_HEADERS = ("店铺名称", "昨日交易额", "昨日订单数")
+SPLIT_HEADERS = {"昨日交易额", "昨日订单数"}
+NUMBER_TEXT = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][+-]?\d+)?$")
+
+
+class CleanSplitError(RuntimeError):
+    """可直接显示给用户的清理错误。"""
+
+
+def desktop_path() -> Path:
+    """从 Windows 注册表获取当前用户的真实桌面目录。"""
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+        ) as key:
+            value, _ = winreg.QueryValueEx(key, "Desktop")
+        return Path(os.path.expandvars(value)).expanduser()
+    except OSError as exc:
+        raise CleanSplitError("无法获取 Windows 桌面路径。") from exc
+
+
+def find_header_row(sheet) -> tuple[int, dict[str, int]]:
+    """精确查找同时包含三个指定标题的标题行。"""
+    for row_index in range(1, sheet.max_row + 1):
+        found: dict[str, int] = {}
+        for column_index in range(1, sheet.max_column + 1):
+            value = sheet.cell(row_index, column_index).value
+            if isinstance(value, str) and value in REQUIRED_HEADERS:
+                found[value] = column_index
+        if all(header in found for header in REQUIRED_HEADERS):
+            return row_index, found
+    raise CleanSplitError("未找到同时包含“店铺名称、昨日交易额、昨日订单数”的标题行。")
+
+
+def excel_general_value(value):
+    """模拟“分列-常规”对单个非空文本数字的类型转换。"""
+    if not isinstance(value, str) or value == "" or value.startswith("="):
+        return value
+    candidate = value.strip()
+    if not candidate or not NUMBER_TEXT.fullmatch(candidate):
+        return value
+    try:
+        number = Decimal(candidate)
+    except InvalidOperation:
+        return value
+    if not number.is_finite():
+        return value
+    return int(number) if number == number.to_integral_value() else float(number)
+
+
+def clean_split_workbook(input_path: Path, output_path: Path) -> Path:
+    """仅清理选定工作簿；不会调用或修改任何日报处理代码。"""
+    workbook = load_workbook(input_path, data_only=False)
+    try:
+        sheet = workbook.active
+        header_row, columns = find_header_row(sheet)
+        keep_columns = set(columns.values())
+        ordered_kept = sorted(keep_columns)
+        kept_dimensions = [
+            copy(sheet.column_dimensions[get_column_letter(column_index)])
+            for column_index in ordered_kept
+        ]
+        for column_index in range(sheet.max_column, 0, -1):
+            if column_index not in keep_columns:
+                sheet.delete_cols(column_index, 1)
+
+        # delete_cols 不迁移 column_dimensions，需按保留列的新位置恢复。
+        sheet.column_dimensions.clear()
+        for new_index, dimension in enumerate(kept_dimensions, start=1):
+            letter = get_column_letter(new_index)
+            dimension.index = letter
+            dimension.min = new_index
+            dimension.max = new_index
+            sheet.column_dimensions[letter] = dimension
+
+        _, remaining = find_header_row(sheet)
+        for header in SPLIT_HEADERS:
+            column_index = remaining[header]
+            for row_index in range(header_row + 1, sheet.max_row + 1):
+                cell = sheet.cell(row_index, column_index)
+                original = cell.value
+                if original is None or original == "":
+                    continue
+                converted = excel_general_value(original)
+                if converted != original or type(converted) is not type(original):
+                    cell.value = converted
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            dir=output_path.parent, prefix=".~clean_split_", suffix=".xlsx", delete=False
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+        try:
+            workbook.save(temporary_path)
+            temporary_path.replace(output_path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+    finally:
+        workbook.close()
+    return output_path
+
+
+class CleanSplitWindow(tk.Toplevel):
+    """与日报页面隔离的独立清理窗口。"""
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.title("Excel数据清理分列助手")
+        self.geometry("650x300")
+        self.minsize(560, 260)
+        self.input_path: Path | None = None
+        self.events: queue.Queue[tuple[str, str]] = queue.Queue()
+        self._build_ui()
+        self.after(100, self._drain_events)
+
+    def _build_ui(self) -> None:
+        frame = ttk.Frame(self, padding=18)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Excel数据清理分列助手", font=("Microsoft YaHei UI", 16, "bold")).pack(anchor="w")
+        ttk.Label(frame, text="仅保留三个指定字段，并将交易额、订单数执行常规分列转换；空值不写入。",
+                  wraplength=600).pack(anchor="w", pady=(4, 16))
+        ttk.Button(frame, text="1. 选择输入Excel文件", command=self.select_file).pack(anchor="w")
+        self.file_label = ttk.Label(frame, text="尚未选择", foreground="#555")
+        self.file_label.pack(anchor="w", pady=(6, 14))
+        self.start_button = ttk.Button(frame, text="2. 开始处理", command=self.start)
+        self.start_button.pack(anchor="w")
+        self.progress = ttk.Progressbar(frame, mode="indeterminate")
+        self.progress.pack(fill="x", pady=(14, 8))
+        self.status_label = ttk.Label(frame, text="输出位置：Windows桌面")
+        self.status_label.pack(anchor="w")
+
+    def select_file(self) -> None:
+        path = filedialog.askopenfilename(parent=self, title="选择Excel文件",
+                                          filetypes=[("Excel 工作簿", "*.xlsx")])
+        if path:
+            self.input_path = Path(path)
+            self.file_label.config(text=str(self.input_path))
+
+    def start(self) -> None:
+        if not self.input_path:
+            messagebox.showwarning("缺少文件", "请先选择一个 XLSX 文件。", parent=self)
+            return
+        self.start_button.config(state="disabled")
+        self.progress.start(10)
+        self.status_label.config(text="正在处理，请勿打开目标文件……")
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def _worker(self) -> None:
+        try:
+            output = desktop_path() / self.input_path.name
+            clean_split_workbook(self.input_path, output)
+            self.events.put(("done", str(output)))
+        except Exception as exc:
+            self.events.put(("error", str(exc)))
+
+    def _drain_events(self) -> None:
+        try:
+            while True:
+                kind, text = self.events.get_nowait()
+                self.progress.stop()
+                self.start_button.config(state="normal")
+                if kind == "done":
+                    self.status_label.config(text=f"处理完成：{text}")
+                    messagebox.showinfo("完成", f"文件已输出到：\n{text}", parent=self)
+                else:
+                    self.status_label.config(text=f"处理失败：{text}")
+                    messagebox.showerror("处理失败", text, parent=self)
+        except queue.Empty:
+            pass
+        if self.winfo_exists():
+            self.after(100, self._drain_events)
+
+# main
+"""Tkinter desktop entry point for Excel日报自动处理助手."""
+from __future__ import annotations
+
+import queue
+import threading
+import traceback
+from datetime import date, datetime
+from pathlib import Path
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+from processor import ProcessingError, process_many
+from excel_clean_split import CleanSplitWindow
+from xls_clean_split import XlsCleanSplitWindow
+
+
+class Application(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Excel日报自动处理助手")
+        self.geometry("820x580")
+        self.minsize(720, 500)
+        self.brand_files: list[Path] = []
+        self.import_file: Path | None = None
+        self.output_dir: Path | None = None
+        self.events: queue.Queue[tuple[str, str]] = queue.Queue()
+        self._build_ui()
+        self.after(100, self._drain_events)
+
+    def _build_ui(self) -> None:
+        container = ttk.Frame(self, padding=16)
+        container.pack(fill="both", expand=True)
+
+        ttk.Button(
+            container,
+            text="Excel数据清理分列",
+            command=self.open_clean_split,
+        ).pack(anchor="e", pady=(0, 10))
+
+        ttk.Button(
+            container,
+            text="XLS数据清理转换",
+            command=self.open_xls_clean_split,
+        ).pack(anchor="e", pady=(0, 10))
+
+        ttk.Label(container, text="Excel日报自动处理助手", font=("Microsoft YaHei UI", 18, "bold")).pack(anchor="w")
+        ttk.Label(container, text="批量处理品牌日报，保留模板格式与公式结构").pack(anchor="w", pady=(2, 14))
+
+        controls = ttk.LabelFrame(container, text="文件选择", padding=12)
+        controls.pack(fill="x")
+        ttk.Label(controls, text="处理日期").grid(row=0, column=0, sticky="w", pady=4)
+        self.date_entry = ttk.Entry(controls, width=20)
+        today = date.today()
+        self.date_entry.insert(0, f"{today.year}/{today.month}/{today.day}")
+        self.date_entry.grid(row=0, column=1, sticky="w", padx=12)
+        ttk.Button(controls, text="1. 选择多个品牌日报 XLSX", command=self.select_brands).grid(row=1, column=0, sticky="ew", pady=4)
+        self.brand_label = ttk.Label(controls, text="尚未选择", foreground="#555")
+        self.brand_label.grid(row=1, column=1, sticky="w", padx=12)
+        ttk.Button(controls, text="2. 选择销售数据 XLSX", command=self.select_import).grid(row=2, column=0, sticky="ew", pady=4)
+        self.import_label = ttk.Label(controls, text="尚未选择", foreground="#555")
+        self.import_label.grid(row=2, column=1, sticky="w", padx=12)
+        ttk.Button(controls, text="3. 选择输出目录", command=self.select_output).grid(row=3, column=0, sticky="ew", pady=4)
+        self.output_label = ttk.Label(controls, text="尚未选择", foreground="#555")
+        self.output_label.grid(row=3, column=1, sticky="w", padx=12)
+        controls.columnconfigure(1, weight=1)
+
+        action = ttk.Frame(container)
+        action.pack(fill="x", pady=12)
+        self.start_button = ttk.Button(action, text="开始处理", command=self.start)
+        self.start_button.pack(side="left")
+        self.progress = ttk.Progressbar(action, mode="indeterminate")
+        self.progress.pack(side="left", fill="x", expand=True, padx=(12, 0))
+
+        ttk.Label(container, text="处理日志").pack(anchor="w")
+        self.log = tk.Text(container, height=18, state="disabled", wrap="word", font=("Consolas", 10))
+        self.log.pack(fill="both", expand=True, pady=(4, 0))
+
+    def open_clean_split(self) -> None:
+        """打开与日报处理逻辑隔离的 Excel 数据清理页面。"""
+        CleanSplitWindow(self)
+
+    def open_xls_clean_split(self) -> None:
+        """打开独立的 XLS 转换清理页面。"""
+        XlsCleanSplitWindow(self)
+
+    def select_brands(self) -> None:
+        paths = filedialog.askopenfilenames(title="选择品牌日报", filetypes=[("Excel 工作簿", "*.xlsx")])
+        if paths:
+            self.brand_files = [Path(path) for path in paths]
+            self.brand_label.config(text=f"已选择 {len(paths)} 个文件")
+
+    def select_import(self) -> None:
+        path = filedialog.askopenfilename(title="选择销售数据文件", filetypes=[("Excel 工作簿", "*.xlsx")])
+        if path:
+            self.import_file = Path(path)
+            self.import_label.config(text=self.import_file.name)
+
+    def select_output(self) -> None:
+        path = filedialog.askdirectory(title="选择输出目录")
+        if path:
+            self.output_dir = Path(path)
+            self.output_label.config(text=str(self.output_dir))
+
+    def start(self) -> None:
+        if not self.brand_files:
+            messagebox.showwarning("缺少文件", "请选择至少一个品牌日报 XLSX 文件。")
+            return
+        if not self.import_file:
+            messagebox.showwarning("缺少文件", "请选择销售数据 XLSX 文件。")
+            return
+        if not self.output_dir:
+            messagebox.showwarning("缺少目录", "请选择输出目录。")
+            return
+        try:
+            self.processing_date = self._parse_date(self.date_entry.get().strip())
+        except ValueError:
+            messagebox.showwarning("日期错误", "处理日期格式应为 YYYY/M/D，例如 2026/8/1。")
+            return
+        self.start_button.config(state="disabled")
+        self.progress.start(10)
+        self._append_log("开始处理，请勿打开或修改相关文件。")
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def _worker(self) -> None:
+        try:
+            outputs = process_many(self.brand_files, self.import_file, self.output_dir, self.processing_date,
+                                   lambda text: self.events.put(("log", text)))
+            self.events.put(("done", f"处理完成，共输出 {len(outputs)} 个文件。"))
+        except ProcessingError as exc:
+            self.events.put(("error", str(exc)))
+        except Exception as exc:
+            traceback.print_exc()
+            self.events.put(("error", f"未预期错误：{exc}"))
+
+    def _drain_events(self) -> None:
+        try:
+            while True:
+                kind, text = self.events.get_nowait()
+                if kind == "log":
+                    self._append_log(text)
+                elif kind == "done":
+                    self._finish()
+                    self._append_log(text)
+                    messagebox.showinfo("完成", text)
+                elif kind == "error":
+                    self._finish()
+                    self._append_log("错误：" + text)
+                    messagebox.showerror("处理失败", text)
+        except queue.Empty:
+            pass
+        self.after(100, self._drain_events)
+
+    def _finish(self) -> None:
+        self.progress.stop()
+        self.start_button.config(state="normal")
+
+    @staticmethod
+    def _parse_date(text: str) -> date:
+        for pattern in ("%Y/%m/%d", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(text, pattern).date()
+            except ValueError:
+                continue
+        raise ValueError(text)
+
+    def _append_log(self, text: str) -> None:
+        self.log.config(state="normal")
+        self.log.insert("end", text + "\n")
+        self.log.see("end")
+        self.log.config(state="disabled")
+
+
+if __name__ == "__main__":
+    Application().mainloop()
+
+# processor
+"""Core workbook transformation logic for Excel日报自动处理助手."""
+from __future__ import annotations
+
+from copy import copy
+from dataclasses import dataclass
+from datetime import date, datetime
+from pathlib import Path
+import re
+from typing import Callable, Iterable
+
+from openpyxl import load_workbook
+from openpyxl.cell.cell import MergedCell
+from openpyxl.formula import Tokenizer
+from openpyxl.formula.translate import Translator
+from openpyxl.utils.cell import column_index_from_string, range_boundaries
+from openpyxl.worksheet.worksheet import Worksheet
+
+
+class ProcessingError(RuntimeError):
+    """Expected input/template error safe to display to the user."""
+
+
+@dataclass(frozen=True)
+class TableLayout:
+    header_row: int
+    data_start_row: int
+    summary_row: int
+    today_sales_col: int
+    order_count_col: int
+    yesterday_sales_col: int | None
+
+
+def _copy_cell(source, target) -> None:
+    """Copy a cell value and all openpyxl-supported presentation metadata."""
+    target.value = source.value
+    if source.has_style:
+        target._style = copy(source._style)
+    if source.number_format:
+        target.number_format = source.number_format
+    target.font = copy(source.font)
+    target.fill = copy(source.fill)
+    target.border = copy(source.border)
+    target.alignment = copy(source.alignment)
+    target.protection = copy(source.protection)
+    if source.hyperlink:
+        target._hyperlink = copy(source.hyperlink)
+    if source.comment:
+        target.comment = copy(source.comment)
+
+
+def copy_external_sheet(source: Worksheet, target: Worksheet) -> None:
+    """Clone worksheet content and formatting between different workbooks."""
+    for row in source.iter_rows():
+        for cell in row:
+            if not isinstance(cell, MergedCell):
+                _copy_cell(cell, target[cell.coordinate])
+
+    for key, dimension in source.row_dimensions.items():
+        target.row_dimensions[key] = copy(dimension)
+    for key, dimension in source.column_dimensions.items():
+        target.column_dimensions[key] = copy(dimension)
+    for merged_range in source.merged_cells.ranges:
+        target.merge_cells(str(merged_range))
+
+    target.freeze_panes = source.freeze_panes
+    target.sheet_format = copy(source.sheet_format)
+    target.sheet_properties = copy(source.sheet_properties)
+    target.views = copy(source.views)
+    target.page_margins = copy(source.page_margins)
+    target.page_setup = copy(source.page_setup)
+    target.print_options = copy(source.print_options)
+    target.auto_filter = copy(source.auto_filter)
+    target.protection = copy(source.protection)
+    target.sheet_state = source.sheet_state
+    target.sheet_properties.pageSetUpPr = copy(source.sheet_properties.pageSetUpPr)
+
+    # Preserve supported worksheet rules without sharing mutable objects.
+    target.data_validations = copy(source.data_validations)
+    target.conditional_formatting = copy(source.conditional_formatting)
+
+
+def _normalize_header(value) -> str:
+    return re.sub(r"[\s\n\r（）()：:]", "", str(value or ""))
+
+
+def detect_layout(sheet: Worksheet) -> TableLayout:
+    """Locate required columns by Chinese headers and identify the summary row."""
+    today_aliases = ("今日销售额", "当天销售额", "今日销额")
+    order_aliases = ("订单数", "今日订单数", "订单量")
+    yesterday_aliases = ("昨日销售额", "昨天销售额")
+    best: tuple[int, dict[str, int]] | None = None
+
+    for row in range(1, min(sheet.max_row, 40) + 1):
+        found: dict[str, int] = {}
+        for col in range(1, sheet.max_column + 1):
+            header = _normalize_header(sheet.cell(row, col).value)
+            if any(alias in header for alias in today_aliases):
+                found.setdefault("today", col)
+            if any(alias in header for alias in order_aliases):
+                found.setdefault("order", col)
+            if any(alias in header for alias in yesterday_aliases):
+                found.setdefault("yesterday", col)
+        if "today" in found and "order" in found:
+            best = (row, found)
+            break
+    if not best:
+        raise ProcessingError("在 7.29 工作表前40行中找不到“今日销售额”和“订单数”表头。")
+
+    header_row, columns = best
+    summary_row = _find_summary_row(sheet, header_row)
+    if summary_row <= header_row + 1:
+        raise ProcessingError("未找到有效的数据区域和最后汇总行。")
+    return TableLayout(
+        header_row=header_row,
+        data_start_row=header_row + 1,
+        summary_row=summary_row,
+        today_sales_col=columns["today"],
+        order_count_col=columns["order"],
+        yesterday_sales_col=columns.get("yesterday"),
+    )
+
+
+def _find_summary_row(sheet: Worksheet, header_row: int) -> int:
+    last_nonempty = header_row
+    keyword_row = None
+    for row in range(header_row + 1, sheet.max_row + 1):
+        values = [sheet.cell(row, col).value for col in range(1, sheet.max_column + 1)]
+        if any(value not in (None, "") for value in values):
+            last_nonempty = row
+        text = "".join(str(value) for value in values if value is not None)
+        if any(word in text for word in ("合计", "汇总", "总计")):
+            keyword_row = row
+    return keyword_row or last_nonempty
+
+
+def sheet_name_for(day: date) -> str:
+    return f"{day.month}.{day.day}"
+
+
+def replace_dates(sheet: Worksheet, old_date: date, new_date: date) -> None:
+    old_texts = (f"{old_date.year}/{old_date.month}/{old_date.day}", old_date.strftime("%Y-%m-%d"))
+    new_texts = (f"{new_date.year}/{new_date.month}/{new_date.day}", new_date.strftime("%Y-%m-%d"))
+    for row in sheet.iter_rows():
+        for cell in row:
+            value = cell.value
+            if isinstance(value, datetime) and value.date() == old_date:
+                cell.value = value.replace(year=new_date.year, month=new_date.month, day=new_date.day)
+            elif isinstance(value, date) and value == old_date:
+                cell.value = new_date
+            elif isinstance(value, str):
+                cell.value = value.replace(old_texts[0], new_texts[0]).replace(old_texts[1], new_texts[1])
+
+
+SHEET_TOKEN = re.compile(r"^(?:'(?P<quoted>(?:[^']|'')+)'|(?P<bare>[^!]+))!(?P<reference>.+)$")
+
+
+def _replace_formula_sheet_references(formula: str, new_sheet: str,
+                                      old_sheet: str | None = None) -> str:
+    """Rewrite RANGE tokens structurally; never parse VLOOKUP argument strings."""
+    tokenizer = Tokenizer(formula)
+    changed = False
+    for token in tokenizer.items:
+        if token.type != "OPERAND" or token.subtype != "RANGE":
+            continue
+        match = SHEET_TOKEN.match(token.value)
+        if not match:
+            continue
+        current = (match.group("quoted") or match.group("bare")).replace("''", "'")
+        if old_sheet is not None and current != old_sheet:
+            continue
+        escaped = new_sheet.replace("'", "''")
+        token.value = f"'{escaped}'!{match.group('reference')}"
+        changed = True
+    return "=" + "".join(token.value for token in tokenizer.items) if changed else formula
+
+
+def update_lookup_formulas(sheet: Worksheet, layout: TableLayout, sales_sheet_name: str) -> int:
+    """Retarget formula RANGE tokens in today's sales/order columns."""
+    changed = 0
+    for row in range(layout.data_start_row, layout.summary_row):
+        for col in (layout.today_sales_col, layout.order_count_col):
+            cell = sheet.cell(row, col)
+            if not (isinstance(cell.value, str) and cell.value.startswith("=")):
+                continue
+            formula = _replace_formula_sheet_references(cell.value, sales_sheet_name)
+            if formula != cell.value:
+                cell.value = formula
+                changed += 1
+    return changed
+
+
+def update_yesterday_sales_formulas(sheet: Worksheet, layout: TableLayout,
+                                    yesterday_sheet_name: str,
+                                    yesterday_sheet_exists: bool) -> int:
+    """Retarget yesterday-sales formulas to processing_date - 1, or write zero."""
+    if layout.yesterday_sales_col is None:
+        return 0
+    changed = 0
+    for row in range(layout.data_start_row, layout.summary_row):
+        cell = sheet.cell(row, layout.yesterday_sales_col)
+        if not yesterday_sheet_exists:
+            if cell.value != 0:
+                cell.value = 0
+                changed += 1
+            continue
+        if isinstance(cell.value, str) and cell.value.startswith("="):
+            updated = _replace_formula_sheet_references(cell.value, yesterday_sheet_name)
+            if updated != cell.value:
+                cell.value = updated
+                changed += 1
+    return changed
+
+
+def _daily_sheet_date(sheet_name: str, processing_date: date) -> date | None:
+    match = re.fullmatch(r"(1[0-2]|[1-9])\.(3[01]|[12]\d|[1-9])", sheet_name.strip())
+    if not match:
+        return None
+    month, day = int(match.group(1)), int(match.group(2))
+    year = processing_date.year
+    if (month, day) >= (processing_date.month, processing_date.day):
+        year -= 1
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None
+
+
+def _select_daily_template(workbook, processing_date: date,
+                           yesterday_sheet_name: str) -> tuple[Worksheet, date, bool]:
+    """Use yesterday as template; if absent, use the latest earlier daily sheet."""
+    yesterday_date = processing_date.fromordinal(processing_date.toordinal() - 1)
+    if yesterday_sheet_name in workbook.sheetnames:
+        return workbook[yesterday_sheet_name], yesterday_date, True
+    candidates = []
+    for sheet in workbook.worksheets:
+        sheet_date = _daily_sheet_date(sheet.title, processing_date)
+        if sheet_date is not None and sheet_date < processing_date:
+            candidates.append((sheet_date, sheet))
+    if not candidates:
+        raise ProcessingError("日报中找不到可用于复制的历史日期工作表。")
+    template_date, template = max(candidates, key=lambda item: item[0])
+    return template, template_date, False
+
+
+def _validate_sortable_merges(sheet: Worksheet, layout: TableLayout) -> None:
+    for merged in sheet.merged_cells.ranges:
+        intersects = not (merged.max_row < layout.data_start_row or merged.min_row >= layout.summary_row)
+        if intersects and merged.max_row > merged.min_row:
+            raise ProcessingError(f"数据区存在跨行合并单元格 {merged}，无法安全排序。")
+
+
+def _sort_key(value):
+    if isinstance(value, (int, float)):
+        return (2, float(value))
+    if value in (None, ""):
+        return (0, 0.0)
+    try:
+        return (2, float(str(value).replace(",", "").replace("¥", "")))
+    except ValueError:
+        return (1, str(value))
+
+
+def _vlookup_arguments(formula: str) -> list[list]:
+    """Return VLOOKUP arguments from openpyxl tokens, including IFERROR wrappers."""
+    tokens = Tokenizer(formula).items
+    start = next(
+        (index for index, token in enumerate(tokens)
+         if token.type == "FUNC" and token.subtype == "OPEN"
+         and token.value.upper() == "VLOOKUP("),
+        None,
+    )
+    if start is None:
+        raise ProcessingError(f"今日销售额公式不是受支持的 VLOOKUP：{formula}")
+    arguments: list[list] = [[]]
+    depth = 1
+    for token in tokens[start + 1:]:
+        if token.type == "FUNC" and token.subtype == "OPEN":
+            depth += 1
+            arguments[-1].append(token)
+        elif token.type == "FUNC" and token.subtype == "CLOSE":
+            if depth == 1:
+                break
+            depth -= 1
+            arguments[-1].append(token)
+        elif token.type == "SEP" and token.subtype == "ARG" and depth == 1:
+            arguments.append([])
+        else:
+            arguments[-1].append(token)
+    if len(arguments) < 4:
+        raise ProcessingError(f"VLOOKUP 参数不完整：{formula}")
+    return arguments
+
+
+def _single_operand(argument: list, subtype: str) -> str:
+    meaningful = [token for token in argument if token.type != "WSPACE"]
+    if len(meaningful) != 1 or meaningful[0].type != "OPERAND" or meaningful[0].subtype != subtype:
+        raise ProcessingError("VLOOKUP 使用了暂不支持的复杂参数结构。")
+    return meaningful[0].value
+
+
+CELL_REFERENCE = re.compile(r"^\$?(?P<column>[A-Z]{1,3})\$?(?P<row>\d+)$", re.IGNORECASE)
+
+
+def vlookup_value_from_structure(formula: str, current_sheet: Worksheet):
+    """Resolve an exact-match VLOOKUP directly from workbook cells without calculation."""
+    arguments = _vlookup_arguments(formula)
+    lookup_reference = _single_operand(arguments[0], "RANGE")
+    lookup_match = CELL_REFERENCE.match(lookup_reference)
+    if not lookup_match:
+        raise ProcessingError(f"VLOOKUP 查找值必须是单元格引用：{lookup_reference}")
+    lookup_value = current_sheet.cell(
+        int(lookup_match.group("row")),
+        column_index_from_string(lookup_match.group("column")),
+    ).value
+
+    table_reference = _single_operand(arguments[1], "RANGE")
+    table_match = SHEET_TOKEN.match(table_reference)
+    if not table_match:
+        raise ProcessingError(f"VLOOKUP 数据区域必须包含工作表引用：{table_reference}")
+    sheet_name = (table_match.group("quoted") or table_match.group("bare")).replace("''", "'")
+    if sheet_name not in current_sheet.parent.sheetnames:
+        raise ProcessingError(f"VLOOKUP 引用的工作表不存在：{sheet_name}")
+    source_sheet = current_sheet.parent[sheet_name]
+    min_col, min_row, max_col, max_row = range_boundaries(table_match.group("reference"))
+    min_row = min_row or 1
+    max_row = max_row or source_sheet.max_row
+
+    index_text = _single_operand(arguments[2], "NUMBER")
+    try:
+        return_index = int(float(index_text))
+    except ValueError as exc:
+        raise ProcessingError(f"VLOOKUP 返回列序号无效：{index_text}") from exc
+    return_col = min_col + return_index - 1
+    if return_index < 1 or return_col > max_col:
+        raise ProcessingError(f"VLOOKUP 返回列超出数据区域：{table_reference}")
+
+    exact_text = _single_operand(arguments[3], "LOGICAL").upper()
+    if exact_text != "FALSE":
+        raise ProcessingError("仅支持 FALSE 精确匹配的 VLOOKUP 排序公式。")
+    for row in range(min_row, min(max_row, source_sheet.max_row) + 1):
+        if source_sheet.cell(row, min_col).value == lookup_value:
+            value = source_sheet.cell(row, return_col).value
+            if isinstance(value, str) and value.startswith("="):
+                raise ProcessingError("销售数据返回列包含公式，无法在无计算引擎时取得排序值。")
+            return value
+    return None
+
+
+def build_sort_values(formula_sheet: Worksheet, layout: TableLayout) -> dict[int, object]:
+    """Read lookup results directly from the referenced sales-data worksheet."""
+    values: dict[int, object] = {}
+    for row in range(layout.data_start_row, layout.summary_row):
+        cell = formula_sheet.cell(row, layout.today_sales_col)
+        value = cell.value
+        if isinstance(value, str) and value.startswith("="):
+            value = vlookup_value_from_structure(value, formula_sheet)
+        values[row] = value
+    return values
+
+
+def sort_data_rows(sheet: Worksheet, layout: TableLayout, sort_values: dict[int, object]) -> None:
+    """Sort complete rows and translate relative formula references after movement."""
+    _validate_sortable_merges(sheet, layout)
+    source_rows = list(range(layout.data_start_row, layout.summary_row))
+    ordered_rows = sorted(
+        source_rows,
+        key=lambda row: _sort_key(sort_values[row]),
+        reverse=True,
+    )
+    snapshots = []
+    for old_row in ordered_rows:
+        row_data = []
+        for col in range(1, sheet.max_column + 1):
+            cell = sheet.cell(old_row, col)
+            row_data.append({
+                "value": cell.value,
+                "style": copy(cell._style),
+                "font": copy(cell.font), "fill": copy(cell.fill),
+                "border": copy(cell.border), "alignment": copy(cell.alignment),
+                "protection": copy(cell.protection), "number_format": cell.number_format,
+                "comment": copy(cell.comment), "hyperlink": copy(cell.hyperlink),
+                "origin": cell.coordinate,
+            })
+        snapshots.append((old_row, copy(sheet.row_dimensions[old_row]), row_data))
+
+    for new_row, (_, dimension, row_data) in zip(source_rows, snapshots):
+        sheet.row_dimensions[new_row] = dimension
+        for col, item in enumerate(row_data, start=1):
+            target = sheet.cell(new_row, col)
+            value = item["value"]
+            if isinstance(value, str) and value.startswith("="):
+                try:
+                    value = Translator(value, origin=item["origin"]).translate_formula(target.coordinate)
+                except Exception:
+                    pass
+            target.value = value
+            target._style = item["style"]
+            target.font, target.fill = item["font"], item["fill"]
+            target.border, target.alignment = item["border"], item["alignment"]
+            target.protection, target.number_format = item["protection"], item["number_format"]
+            target.comment, target._hyperlink = item["comment"], item["hyperlink"]
+
+
+def _outer_iferror_expression(tokens: list) -> str | None:
+    meaningful = [token for token in tokens if token.type != "WSPACE"]
+    if not meaningful or not (
+        meaningful[0].type == "FUNC" and meaningful[0].subtype == "OPEN"
+        and meaningful[0].value.upper() == "IFERROR("
+    ):
+        return None
+    expression = []
+    depth = 1
+    for token in meaningful[1:]:
+        if token.type == "FUNC" and token.subtype == "OPEN":
+            depth += 1
+        elif token.type == "FUNC" and token.subtype == "CLOSE":
+            depth -= 1
+            if depth == 0:
+                break
+        if token.type == "SEP" and token.subtype == "ARG" and depth == 1:
+            break
+        expression.append(token.value)
+    return "".join(expression) if expression else None
+
+
+def normalize_division_formulas(sheet: Worksheet) -> int:
+    """Preserve each division expression and standardize its IFERROR wrapper."""
+    changed = 0
+    for row in sheet.iter_rows():
+        for cell in row:
+            formula = cell.value
+            if not (isinstance(formula, str) and formula.startswith("=")):
+                continue
+            tokens = Tokenizer(formula).items
+            has_division = any(
+                token.type == "OPERATOR-INFIX" and token.value == "/" for token in tokens
+            )
+            if not has_division:
+                continue
+            expression = _outer_iferror_expression(tokens) or formula[1:]
+            normalized = f'=IFERROR(({expression}),"0")'
+            if normalized != formula:
+                cell.value = normalized
+                changed += 1
+    return changed
+
+
+def fill_sequence_column(sheet: Worksheet, summary_row: int) -> int:
+    """Fill B2 downward with 1..N, leaving the final summary row untouched."""
+    count = max(0, summary_row - 2)
+    for sequence, row in enumerate(range(2, summary_row), start=1):
+        sheet.cell(row, 2).value = sequence
+    return count
+
+
+def duplicate_template_sheet(workbook, source: Worksheet, target_name: str) -> Worksheet:
+    """Create today's sheet via copy_worksheet; never rebuild template cells."""
+    source_index = workbook.worksheets.index(source)
+    duplicate = workbook.copy_worksheet(source)
+    temporary_name = f"{source.title} (2)"
+    suffix = 2
+    while temporary_name in workbook.sheetnames and workbook[temporary_name] is not duplicate:
+        suffix += 1
+        temporary_name = f"{source.title} ({suffix})"
+    duplicate.title = temporary_name
+    # openpyxl copy_worksheet omits these worksheet-level collections.
+    duplicate.conditional_formatting = copy(source.conditional_formatting)
+    duplicate.data_validations = copy(source.data_validations)
+    duplicate.freeze_panes = source.freeze_panes
+    duplicate.sheet_format = copy(source.sheet_format)
+    duplicate.sheet_properties = copy(source.sheet_properties)
+    duplicate.views = copy(source.views)
+    duplicate.page_margins = copy(source.page_margins)
+    duplicate.page_setup = copy(source.page_setup)
+    duplicate.print_options = copy(source.print_options)
+    duplicate.auto_filter = copy(source.auto_filter)
+    duplicate.protection = copy(source.protection)
+
+    # Required order: copy first, then remove a pre-existing target, then rename.
+    if target_name in workbook.sheetnames and workbook[target_name] is not duplicate:
+        del workbook[target_name]
+    duplicate.title = target_name
+
+    # Keep today's sheet directly after yesterday's sheet.
+    workbook._sheets.remove(duplicate)
+    workbook._sheets.insert(source_index + 1, duplicate)
+    return duplicate
+
+
+def restore_summary_formulas(source: Worksheet, target: Worksheet, layout: TableLayout,
+                             source_sheet_name: str, target_sheet_name: str) -> None:
+    """Recreate target summary formulas from the 7.29 template instead of values."""
+    formula_count = 0
+    for col in range(1, source.max_column + 1):
+        source_cell = source.cell(layout.summary_row, col)
+        if isinstance(source_cell.value, str) and source_cell.value.startswith("="):
+            target.cell(layout.summary_row, col).value = _replace_formula_sheet_references(
+                source_cell.value, target_sheet_name, old_sheet=source_sheet_name
+            )
+            formula_count += 1
+    if formula_count == 0:
+        raise ProcessingError(
+            f"{source_sheet_name} 最后汇总行没有公式，无法按模板重建 {target_sheet_name} 汇总行。"
+        )
+
+
+def _choose_import_sheet(workbook, expected_name: str) -> Worksheet:
+    if expected_name in workbook.sheetnames:
+        return workbook[expected_name]
+    if len(workbook.sheetnames) == 1:
+        return workbook.active
+    raise ProcessingError(f"销售文件包含多个工作表且没有名为“{expected_name}”的工作表。")
+
+
+def process_workbook(brand_path: Path, import_path: Path, output_dir: Path,
+                     processing_date: date,
+                     logger: Callable[[str], None] = lambda _: None) -> Path:
+    """Process one brand workbook and return its output path."""
+    output_path = output_dir / brand_path.name
+    if output_path.resolve() == brand_path.resolve():
+        raise ProcessingError("输出目录不能与源文件目录相同，以免覆盖原始日报。")
+
+    previous_date = processing_date.fromordinal(processing_date.toordinal() - 1)
+    source_sheet_name = sheet_name_for(previous_date)
+    target_sheet_name = sheet_name_for(processing_date)
+    sales_sheet_name = import_path.stem
+    logger(f"当前处理日期：{processing_date.year}/{processing_date.month}/{processing_date.day}")
+    logger(f"读取销售文件：{import_path.name}")
+    logger(f"生成工作表：{target_sheet_name}")
+    logger(f"昨日工作表：{source_sheet_name}")
+    logger(f"修改VLOOKUP：'{sales_sheet_name}'工作表")
+    logger(f"读取品牌日报：{brand_path.name}")
+
+    workbook = load_workbook(brand_path, data_only=False)
+    import_workbook = load_workbook(import_path, data_only=False)
+    try:
+        source, template_date, yesterday_sheet_exists = _select_daily_template(
+            workbook, processing_date, source_sheet_name
+        )
+        if not yesterday_sheet_exists:
+            logger(
+                f"昨日工作表 {source_sheet_name} 不存在，使用 {source.title} 作为格式模板；"
+                "昨日销售额填0。"
+            )
+
+        if sales_sheet_name in workbook.sheetnames:
+            del workbook[sales_sheet_name]
+        imported = workbook.create_sheet(sales_sheet_name)
+        copy_external_sheet(_choose_import_sheet(import_workbook, sales_sheet_name), imported)
+
+        target = duplicate_template_sheet(workbook, source, target_sheet_name)
+        logger(f"已通过 copy_worksheet 完整复制：{source.title} → {target_sheet_name}")
+        layout = detect_layout(target)
+        replace_dates(target, template_date, processing_date)
+        changed = update_lookup_formulas(target, layout, sales_sheet_name)
+        if changed == 0:
+            raise ProcessingError("今日销售额和订单数列中没有可修改的外部工作表引用公式。")
+        yesterday_changed = update_yesterday_sales_formulas(
+            target, layout, source_sheet_name, yesterday_sheet_exists
+        )
+        if layout.yesterday_sales_col is not None:
+            if yesterday_sheet_exists:
+                logger(f"昨日销售额已动态引用：'{source_sheet_name}'工作表，共修改 {yesterday_changed} 行")
+            else:
+                logger(f"昨日工作表不存在，昨日销售额已填0，共处理 {yesterday_changed} 行")
+        restore_summary_formulas(source, target, layout, source.title, target_sheet_name)
+
+        sort_values = build_sort_values(target, layout)
+        sort_data_rows(target, layout, sort_values)
+        logger("已从VLOOKUP引用的销售数据区域读取数值并完成降序排序")
+        division_count = normalize_division_formulas(target)
+        sequence_count = fill_sequence_column(target, layout.summary_row)
+        logger(f"已统一保护 {division_count} 个除法公式：=IFERROR((...),\"0\")")
+        logger(f"B列已从B2按序列填充，共 {sequence_count} 行")
+
+        try:
+            workbook.calculation.fullCalcOnLoad = True
+            workbook.calculation.forceFullCalc = True
+            workbook.calculation.calcMode = "auto"
+        except AttributeError:
+            pass
+        output_dir.mkdir(parents=True, exist_ok=True)
+        workbook.save(output_path)
+    finally:
+        workbook.close()
+        import_workbook.close()
+    logger(f"输出完成：{output_path}")
+    return output_path
+
+
+def process_many(brand_files: Iterable[Path], import_path: Path, output_dir: Path,
+                 processing_date: date,
+                 logger: Callable[[str], None] = lambda _: None) -> list[Path]:
+    results = []
+    for path in brand_files:
+        results.append(process_workbook(path, import_path, output_dir, processing_date, logger))
+    return results
+
+# xls_clean_split
+"""独立的 XLS 转 XLSX 数据清理分列模块。
+
+本模块不导入 processor.py 或 excel_clean_split.py。旧版 XLS 的格式保真转换与
+TextToColumns 均交给 Microsoft Excel COM；openpyxl 仅用于 data_only=False 的
+结构读取、原始值记录和最终结果校验。
+"""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import queue
+import subprocess
+import tempfile
+import threading
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+import winreg
+
+from openpyxl import load_workbook
+
+
+REQUIRED_HEADERS = ("店铺名称", "昨日交易额", "昨日订单数")
+
+
+class XlsCleanSplitError(RuntimeError):
+    """可安全显示给用户的转换或校验错误。"""
+
+
+def desktop_path() -> Path:
+    """读取 Windows 当前用户配置的桌面目录。"""
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+        ) as key:
+            value, _ = winreg.QueryValueEx(key, "Desktop")
+        return Path(os.path.expandvars(value)).expanduser()
+    except OSError as exc:
+        raise XlsCleanSplitError("无法获取 Windows 桌面路径。") from exc
+
+
+def _normalized_header(value) -> str | None:
+    return value.strip() if isinstance(value, str) else None
+
+
+def find_header_row(sheet) -> tuple[int, dict[str, int]]:
+    """允许标题前后空格，但规范化后必须与三个字段精确相等。"""
+    for row_index in range(1, sheet.max_row + 1):
+        found: dict[str, int] = {}
+        for column_index in range(1, sheet.max_column + 1):
+            header = _normalized_header(sheet.cell(row_index, column_index).value)
+            if header in REQUIRED_HEADERS:
+                if header in found:
+                    raise XlsCleanSplitError(f"标题行存在重复字段：{header}")
+                found[header] = column_index
+        if all(header in found for header in REQUIRED_HEADERS):
+            return row_index, found
+    raise XlsCleanSplitError("未找到店铺名称、昨日交易额、昨日订单数三个标题。")
+
+
+def inspect_converted_workbook(path: Path) -> tuple[int, int, int, dict[str, int], dict[str, list[int]]]:
+    """用 openpyxl(data_only=False) 读取并记录所有原始单元格值。"""
+    workbook = load_workbook(path, data_only=False, read_only=False)
+    try:
+        sheet = workbook.active
+        header_row, columns = find_header_row(sheet)
+        # 明确读取所有原始单元格，而非只读三列。
+        original_values = {
+            cell.coordinate: cell.value
+            for row in sheet.iter_rows()
+            for cell in row
+        }
+        nonempty_rows: dict[str, list[int]] = {}
+        for header in ("昨日交易额", "昨日订单数"):
+            column_index = columns[header]
+            nonempty_rows[header] = [
+                row_index
+                for row_index in range(header_row + 1, sheet.max_row + 1)
+                if original_values.get(sheet.cell(row_index, column_index).coordinate) is not None
+            ]
+        return workbook.index(sheet) + 1, header_row, sheet.max_column, columns, nonempty_rows
+    finally:
+        workbook.close()
+
+
+def verify_output(path: Path) -> None:
+    """校验最终三列、标题顺序，并确保结果仍可由 openpyxl 读取。"""
+    workbook = load_workbook(path, data_only=False, read_only=False)
+    try:
+        sheet = workbook.active
+        header_row, columns = find_header_row(sheet)
+        expected = {header: index for index, header in enumerate(REQUIRED_HEADERS, start=1)}
+        if columns != expected or sheet.max_column != 3:
+            raise XlsCleanSplitError("输出列结构校验失败，未严格生成指定的 A、B、C 三列。")
+        # 再次逐个读取，确保保存后的内容结构完整可访问。
+        for row in sheet.iter_rows(min_row=header_row):
+            for cell in row:
+                _ = cell.value
+    finally:
+        workbook.close()
+
+
+def _ps_quote(value: Path | str) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _run_excel_script(script: str) -> None:
+    """运行独立 PowerShell/Excel COM 脚本，不依赖 pywin32。"""
+    script_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".ps1", delete=False) as handle:
+            script_path = Path(handle.name)
+        script_path.write_text(script, encoding="utf-8-sig")
+        completed = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+             "-File", str(script_path)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=300,
+        )
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout).strip()
+            raise XlsCleanSplitError(
+                "Microsoft Excel 转换失败。请确认电脑已安装 Excel，且输入/输出文件未被占用。"
+                + (f"\n{detail}" if detail else "")
+            )
+    except FileNotFoundError as exc:
+        raise XlsCleanSplitError("无法启动 Windows PowerShell。") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise XlsCleanSplitError("Excel 转换超过 5 分钟，操作已停止。") from exc
+    finally:
+        if script_path:
+            script_path.unlink(missing_ok=True)
+
+
+def _conversion_script(input_path: Path, output_path: Path) -> str:
+    """由 Excel 原生 SaveAs 将 BIFF8 XLS 转成 Open XML XLSX。"""
+    return f"""
+$ErrorActionPreference = 'Stop'
+$excel = $null
+$book = $null
+try {{
+    $excel = New-Object -ComObject Excel.Application
+    $excel.Visible = $false
+    $excel.DisplayAlerts = $false
+    $book = $excel.Workbooks.Open({_ps_quote(input_path)}, 0, $true)
+    $book.SaveAs({_ps_quote(output_path)}, 51)
+    $book.Close($false)
+    $book = $null
+}} finally {{
+    if ($null -ne $book) {{ $book.Close($false) }}
+    if ($null -ne $excel) {{ $excel.Quit() }}
+    if ($null -ne $book) {{ [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($book) }}
+    if ($null -ne $excel) {{ [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($excel) }}
+    [GC]::Collect(); [GC]::WaitForPendingFinalizers()
+}}
+"""
+
+
+def _processing_script(path: Path, sheet_index: int, header_row: int, max_column: int,
+                       nonempty_rows: dict[str, list[int]]) -> str:
+    sales_rows = ",".join(str(row) for row in nonempty_rows["昨日交易额"])
+    order_rows = ",".join(str(row) for row in nonempty_rows["昨日订单数"])
+    return f"""
+$ErrorActionPreference = 'Stop'
+$excel = $null
+$book = $null
+try {{
+    $excel = New-Object -ComObject Excel.Application
+    $excel.Visible = $false
+    $excel.DisplayAlerts = $false
+    $book = $excel.Workbooks.Open({_ps_quote(path)}, 0, $false)
+    $sheet = $book.Worksheets.Item({sheet_index})
+    $wanted = @('店铺名称','昨日交易额','昨日订单数')
+    for ($column = {max_column}; $column -ge 1; $column--) {{
+        $header = ([string]$sheet.Cells.Item({header_row}, $column).Value2).Trim()
+        if ($wanted -notcontains $header) {{ $sheet.Columns.Item($column).Delete() }}
+    }}
+    for ($target = 1; $target -le 3; $target++) {{
+        $current = 0
+        for ($column = 1; $column -le 3; $column++) {{
+            if (([string]$sheet.Cells.Item({header_row}, $column).Value2).Trim() -eq $wanted[$target - 1]) {{
+                $current = $column; break
+            }}
+        }}
+        if ($current -eq 0) {{ throw '保留字段在转换过程中丢失。' }}
+        if ($current -ne $target) {{
+            $sheet.Columns.Item($current).Cut()
+            $sheet.Columns.Item($target).Insert(-4161)
+            $excel.CutCopyMode = 0
+        }}
+    }}
+    $salesRows = @({sales_rows})
+    foreach ($row in $salesRows) {{
+        $cell = $sheet.Cells.Item($row, 2)
+        $cell.TextToColumns($cell, 1, 1, $false, $false, $false, $false, $false, $false, '', @(@(1,1)), '.', ',', $true)
+    }}
+    $orderRows = @({order_rows})
+    foreach ($row in $orderRows) {{
+        $cell = $sheet.Cells.Item($row, 3)
+        $cell.TextToColumns($cell, 1, 1, $false, $false, $false, $false, $false, $false, '', @(@(1,1)), '.', ',', $true)
+    }}
+    $book.Save()
+    $book.Close($true)
+    $book = $null
+}} finally {{
+    if ($null -ne $book) {{ $book.Close($false) }}
+    if ($null -ne $excel) {{ $excel.Quit() }}
+    if ($null -ne $book) {{ [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($book) }}
+    if ($null -ne $excel) {{ [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($excel) }}
+    [GC]::Collect(); [GC]::WaitForPendingFinalizers()
+}}
+"""
+
+
+def process_xls(input_path: Path, output_path: Path) -> Path:
+    """转换、记录原值、原生分列、校验并原子输出。"""
+    if input_path.suffix.lower() != ".xls":
+        raise XlsCleanSplitError("请选择扩展名为 .xls 的旧版 Excel 文件。")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=output_path.parent, prefix="xls_clean_split_") as folder:
+        working = Path(folder) / (input_path.stem + ".xlsx")
+        _run_excel_script(_conversion_script(input_path.resolve(), working.resolve()))
+        sheet_index, header_row, max_column, _columns, nonempty_rows = inspect_converted_workbook(working)
+        _run_excel_script(
+            _processing_script(working.resolve(), sheet_index, header_row, max_column, nonempty_rows)
+        )
+        verify_output(working)
+        working.replace(output_path)
+    return output_path
+
+
+class XlsCleanSplitWindow(tk.Toplevel):
+    """XLS 转换清理功能的独立窗口。"""
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.title("XLS转XLSX数据清理分列助手")
+        self.geometry("680x320")
+        self.minsize(580, 280)
+        self.input_path: Path | None = None
+        self.events: queue.Queue[tuple[str, str]] = queue.Queue()
+        self._build_ui()
+        self.after(100, self._drain_events)
+
+    def _build_ui(self) -> None:
+        frame = ttk.Frame(self, padding=18)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="XLS转XLSX数据清理分列助手",
+                  font=("Microsoft YaHei UI", 16, "bold")).pack(anchor="w")
+        ttk.Label(frame, text="使用 Microsoft Excel 原生转换和分列，结果自动保存到桌面。",
+                  wraplength=620).pack(anchor="w", pady=(4, 16))
+        ttk.Button(frame, text="1. 选择XLS文件", command=self.select_file).pack(anchor="w")
+        self.file_label = ttk.Label(frame, text="尚未选择", foreground="#555")
+        self.file_label.pack(anchor="w", pady=(6, 14))
+        self.start_button = ttk.Button(frame, text="2. 开始转换并处理", command=self.start)
+        self.start_button.pack(anchor="w")
+        self.progress = ttk.Progressbar(frame, mode="indeterminate")
+        self.progress.pack(fill="x", pady=(14, 8))
+        self.status_label = ttk.Label(frame, text="运行要求：电脑已安装 Microsoft Excel")
+        self.status_label.pack(anchor="w")
+
+    def select_file(self) -> None:
+        path = filedialog.askopenfilename(parent=self, title="选择XLS文件",
+                                          filetypes=[("Excel 97-2003 工作簿", "*.xls")])
+        if path:
+            self.input_path = Path(path)
+            self.file_label.config(text=str(self.input_path))
+
+    def start(self) -> None:
+        if not self.input_path:
+            messagebox.showwarning("缺少文件", "请先选择一个 .xls 文件。", parent=self)
+            return
+        self.start_button.config(state="disabled")
+        self.progress.start(10)
+        self.status_label.config(text="正在转换和处理，请勿打开相关文件……")
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def _worker(self) -> None:
+        try:
+            output = desktop_path() / f"{self.input_path.stem}.xlsx"
+            process_xls(self.input_path, output)
+            self.events.put(("done", str(output)))
+        except Exception as exc:
+            self.events.put(("error", str(exc)))
+
+    def _drain_events(self) -> None:
+        try:
+            while True:
+                kind, text = self.events.get_nowait()
+                self.progress.stop()
+                self.start_button.config(state="normal")
+                if kind == "done":
+                    self.status_label.config(text=f"处理完成：{text}")
+                    messagebox.showinfo("完成", f"文件已输出到：\n{text}", parent=self)
+                else:
+                    self.status_label.config(text=f"处理失败：{text}")
+                    messagebox.showerror("处理失败", text, parent=self)
+        except queue.Empty:
+            pass
+        if self.winfo_exists():
+            self.after(100, self._drain_events)
